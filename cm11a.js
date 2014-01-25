@@ -9,242 +9,320 @@
  */
 
 var SerialPort = require('serialport').SerialPort,
-    util = require('util'),
-    events = require('events');
+	util = require('util'),
+	events = require('events'),
+	_ = require('underscore'),
+	x10 = require('./x10'),
+	X10Address = x10.Address,
+	X10Command = x10.Command;
 
-var _functionCodes = {
-  "All Units Off": 0x0,
-  "All Lights On": 0x1,
-  "On": 0x2,
-  "Off": 0x3,
-  "Dim": 0x4,
-  "Bright": 0x5,
-  "All Lights Off": 0x6,
-  "Extended Code": 0x7,
-  "Hail Request": 0x8,
-  "Hail Acknowledge": 0x9,
-  "Pre-set Dim (1)": 0xA,
-  "Pre-set Dim (2)": 0xB,
-  "Extended Data Transfer": 0xC,
-  "Status On": 0xD,
-  "Status Off": 0xE,
-  "Status Request": 0xF
+
+var CHECKSUM_CORRECT = 0x00,
+	READY = 0x55,
+	EXTENDED_TRANSMISSION = 0x07,
+	POLL = 0x5a,
+	ACK = 0xc3,
+	POWER_FAIL = 0xa5,
+	CLOCK_UPDATE = 0x9b,
+	EEPROM_DOWNLOAD = 0xfb,
+	RI_ENABLE = 0xeb,
+	RI_DISABLE = 0xdb,
+	EEPROM_ADDRESS = 0x5b,
+	CM11A_STATUS = 0x8b;
+
+
+var SIGNAL_RESPONSE = {};
+
+SIGNAL_RESPONSE[READY] = function (controller) {
+	controller.isReady = true;
+	controller.emit('ready');
 };
 
-var _signals = {
-  "poll": 0x5a,
-  "ack": 0xc3
+SIGNAL_RESPONSE[READY] = function (controller) {
+	controller.isReady = true;
+	controller.emit('ready');
 };
 
-var _serialPortOptions = {
-  baudrate: 4800,
-  parity: 'none',
-  databits: 8,
-  stopbits: 1
+SIGNAL_RESPONSE[POLL] = function (controller) {
+	controller.sp.once("data", function (data) {
+		var length, functionAddressMask;
+		// the response is defined protocol
+		// in sections 4.3-5 and an example is given in 4.6
+		// minimum three bytes, maximum ten bytes
+		if ((data.length >= 3) && (data.length <= 10)) {
+			// first byte indicates length
+			length = data.shift();
+			if (length !== (data.length + 1)) {
+				throw new Error("Response length does not match the specified buffer upload length.");
+			}
+			// second byte is the function/address mask
+			functionAddressMask = data.shift();
+			// the remaining bytes are either addresses or functions
+			_.each(data, function(byt, index) {
+				var maskAtIndex = functionAddressMask & Math.pow(2, index);
+				// If the bit is set (1), the data byte is defined as a function,
+				// and if reset (0), the byte is an address.
+				if (maskAtIndex === 0) {
+					controller.emit("address", new X10Address(byt));
+				} else {
+					// data byte is a function
+					// TODO
+					// if function is dim or bright
+					// then shift the next byte and emit it as the brightness level
+					// n / 210 * 100%
+					controller.emit("command", new X10Command(byt));
+				}
+			});
+		} else {
+			throw new Error("Invalid response length, " + data.length);
+		}
+	});
+	controller.emit('poll');
+	controller.sp.write([ACK]);
+};
+
+SIGNAL_RESPONSE[POWER_FAIL] = function (controller) {
+	controller.emit('powerfail');
+	controller.sp.write([CLOCK_UPDATE]);
 };
 
 /**
- * @class The cm11a object represents an X10 Activehome interface.
+ * @class The Controller object represents a CM11A X-10 ActiveHome interface.
  * @augments EventEmitter
  * @param {String} port This is the serial port the cm11a is connected to.
  * @param {function} function A function to be called when the interface is ready to communicate.
  * @property firmware An object indication the name, major and minor version of the firmware currently running.
- * @property currentBuffer An array holding the current bytes received from the cm11a.
+ * @property receiveBuffer An array holding the current bytes received from the cm11a.
  * @property {SerialPort} sp The serial port object used to communicate with the cm11a.
  */
 
-function cm11a(port, callback) {
-  events.EventEmitter.call(this);
-  
-  this.firmware = {};
-  this.currentBuffer = [];
-  this.versionReceived = false;
-  if (typeof port === 'object'){
-      this.sp = port;
-  } else { 
-      this.sp = new SerialPort(port, {
-          baudrate: 4800,
-          buffersize: 1
-      });   
-  }
-  this.sp.on('error', function(string) {
-      callback(string);
-  });
-  
-  this.sp.on('data', function(data) {
-    // anaylize data and emit events
-    // TODO
-    
-  });
-  
-  if ( !(this instanceof cm11a) ) {
-    return new cm11a( path, options, openImmediately );
-  }
-  
-  options = options || {};
-  options.__proto__ = _options;
-  
-  var self;
-  
-  self = this;
-  
-  self.encode = function (value) {
-    var codes, index;
+function Controller(port, callback) {
+	events.EventEmitter.call(this);
 
-    // The housecodes and device codes range from A to P and 1 to 16 respectively although they do not follow a binary sequence. The encoding format for these codes is as follows:
-    codes = [0x6, 0xE, 0x2, 0xA, 0x1, 0x9, 0x5, 0xD, 0x7, 0xF, 0x3, 0xB, 0x0, 0x8, 0x4, 0xC];
+	callback = callback || function () {};
 
-    // if value is not a number then ...
-    if (Number.isNaN(value)) {
-      // if value is a lower case a-p then ...
-      if (value.match(/^[a-p]$/)) {
-        // convert it to uppercase
-        value = value.toUpperCase();
-      }
-      // if value is an upper case A-P then ...
-      if (value.match(/^[A-P]$/)) {
-        // convert it to a device code by subtracting 64
-        value = value.charCodeAt(0) - 64;
-      }
-    }
+	var controller = this;
 
-    if (Number.isFinite(value) && value > 0 && value <= 16) {
-      // set the index to one less then the value
-      value -= 1;
-    } else {
-      // throw exception because code is out of allowed range
-      throw new Exception("House codes and device codes must be in the range from A to P and 1 to 16 respectively.");
-    }
+	// as defined in section 9 in docs/protocol.txt
+	this.firmwareRevision = 0x0;  // level 0 to 15
+	this.monitored = {};
+	this.monitored.houseCode = 0x0;
+	this.monitored.devices = {};
+	this.monitored.devices.lastAddressed = 0;
+	this.monitored.devices.currentlyAddressed = 0;
+	this.monitored.devices.status = {};
+	this.monitored.devices.status.onOff = 0;
+	this.monitored.devices.status.dim = 0;
 
-    // return integer from hex value in codes
-    return codes[value];
-  };
+	this.isReady = false;
+	this.retry = {};
+	this.retry.max = 3;
+	this.retry.count = 0;
+	this.ringIndicator = true;
 
-  // as defined in section 9 in docs/protocol.txt
-  self.status = {
-    "battery": 0xffff, // set to 0xffff on reset
-    "currentTime": {
-      "seconds": 0,
-      "minutes": 0,
-      "hours": 0
-    },
-    "currentYearDay": 0, // MSB bit 63
-    "dayMask": 0, // SMTWTFS
-    "monitoredHouseCode": 0,
-    "firmwareRevision": 0, // level 0 to 15
-    "monitoredDevices": {
-      "currentlyAddressed": 0,
-      "status": {
-        "onOff": 0,
-        "dim": 0
-      }
-    }
-  };
+	this.transmitBuffer = [];
+	this.receiveBuffer = [];
 
-  board.once('statusRequest', function () {
-    board.once('hailRequest', function () {
-      callback();
-    });
-  });
+	if (typeof port === 'object') {
+		this.sp = port;
+	} else { 
+		this.sp = new SerialPort(port, {
+			baudRate: 4800,
+			parity: 'none',
+			dataBits: 8,
+			stopBits: 1,
+			bufferSize: 1
+		});
+	}
+	this.sp.on("error", function (string) {
+		console.error(string);
+		callback(string);
+	});
+
+	this.sp.on("data", function (data) {
+		var byt, cmd, i, l;
+		// anaylize data and emit events
+		for (i = 0, l = data.length; i < l; i += 1) {
+			byt = data[i];
+			// we dont want to push 0 as the first byte on our buffer
+			if (false && controller.receiveBuffer.length === 0 && byt === 0) {
+				continue;
+			} else {
+				controller.receiveBuffer.push(byt);
+				
+				if (SIGNAL_RESPONSE[byt] !== undefined) {
+					SIGNAL_RESPONSE[byt](controller);
+					controller.receiveBuffer.length = 0;
+				}
+			}
+		}
+	});
+
+	if ( !(this instanceof Controller) ) {
+		return new Controller( port, callback );
+	}
+	
+	this.queryStatus(callback);
 }
+util.inherits(Controller, events.EventEmitter);
 
-util.inherits(cm11a, events.EventEmitter);
 
 /**
  * Asks the cm11a to tell us its current status.
  * @param {function} callback A function to be called when the cm11a has reported its firmware version.
  */
 
-cm11a.prototype.statusRequest = function(callback) {
-    this.once('statusRequest', callback);
-    this.sp.write(0x8b);
+Controller.prototype.queryStatus = function (callback) {
+	var controller = this;
+
+	controller.once("querystatus", callback);
+	controller.sp.once("data", function (data) {
+		// expects a 14 byte response
+		if (data.length === 14) {
+			
+			controller.monitored.houseCode = data[7]>>>4;
+			controller.firmwareRevision = data[7]&0x0F;
+			controller.isReady = true;
+			// finish up by enabling ring
+			controller.enableRing(function () {
+				controller.emit('querystatus', data);
+			});
+		} else {
+			throw new Error("Invalid response length, " + data.length);
+		}
+	});
+	this.sp.write([CM11A_STATUS]);
 };
 
-cm11a.prototype.standardTransmission = cm11a.prototype.transmission = cm11a.prototype.transmit = cm11a.prototype.tx = cm11a.prototype.t = function (callback) {
-  console.log("Standard Transmission");
-  
+/**
+ * Transmits data to the cm11a and verifies the the result
+ * @param {array} dataReceived The address of the I2C device
+ * @param {array} dataTransmitted The number of bytes to receive.
+ * @param {function} callback A function to call when the checksum is verfied.
+ */
+
+Controller.prototype.transmit = function (data, callback) {
+	var controller = this;
+
+	if (data !== undefined && data !== null) {
+		data = _.isArray(data) ? data : [data];
+		this.transmitBuffer.push([data, callback]);
+	}
+	if (this.transmitBuffer.length > 0) {
+		if (this.isReady) {
+			this.isReady = false;
+			// transmit an item in the buffer
+			// peek at the buffer
+			// remove item from buffer once the checksum is verified
+			data = this.transmitBuffer[0][0];
+			callback = this.transmitBuffer[0][1];
+			this.sp.once("data", function (dataReceived) {
+				controller.verify(dataReceived, data, callback);
+			});
+			this.sp.write(data);
+		} else {
+			// wait until ready
+			this.once('ready', this.transmit);
+		}
+	}
 };
 
-cm11a.prototype.allUnitsOff = function (options, callback) {
-  var functionName, functionCode;
 
-  functionName = "All Units Off";
-  functionCode = _functionCodes[functionName];
-
-  console.log(functionName);
+/**
+ * Verifies the cm11a checksum against the data transmitted
+ * @param {array} dataReceived The address of the I2C device
+ * @param {array} dataTransmitted The number of bytes to receive.
+ * @param {function} callback A function to call when the checksum is verfied.
+ */
+Controller.prototype.verify = function (dataReceived, dataTransmitted, callback) {
+	var checksum;
+	
+	if (dataReceived.length === 1) {
+		checksum = _.reduce(dataTransmitted, function (memo, byt) {
+			return memo + byt;
+		}, 0x00) & 0xff;
+		if (dataReceived[0] === checksum) {
+			this.emit("checksumcorrect", checksum, dataReceived, dataTransmitted);
+			this.retry.count = 0;
+			this.transmitBuffer.shift();
+			this.once("ready", callback);
+			this.sp.write([CHECKSUM_CORRECT]);
+		} else {
+			this.emit("checksumincorrect", checksum, dataReceived, dataTransmitted);
+			if (this.retry.count < this.retry.max) {
+				this.retry.count += 1;
+				this.isReady = true;
+				this.emit("retransmit", checksum, dataReceived, dataTransmitted);
+				this.transmit();
+			} else {
+				this.emit("transmissionfailed", checksum, dataReceived, dataTransmitted, callback);
+				this.removeListener("ready", callback);
+				this.transmitBuffer.shift();
+				this.retry.count = 0;
+				this.isReady = true;
+			}
+		}
+	} else {
+		throw new Error("Invalid response length.  Received " + dataReceived.length + " byte(s), expected 1 byte.");
+	}
 };
 
-cm11a.prototype.allLightsOn = function (options, callback) {
-  var functionName, functionCode;
-
-  functionName = "All Lights On";
-  functionCode = _functionCodes[functionName];
-
-  console.log(functionName);
-
+Controller.prototype.enableRing = function (callback) {
+	var controller = this;
+	this.once("ringenabled", callback);
+	this.transmit(0xeb, function () {
+		controller.ringIndicator = true;
+		controller.emit("ringenabled");
+	});
 };
 
-cm11a.prototype.on = function (options, callback) {
-  var functionName, functionCode;
-
-  functionName = "On";
-  functionCode = _functionCodes[functionName];
-
-  console.log(functionName);
-
+Controller.prototype.disableRing = function(callback) {
+	var controller = this;
+	this.once("ringdisabled", callback);
+	this.transmit(0xdb, function () {
+		controller.ringIndicator = false;
+		controller.emit("ringdisabled");
+	});
 };
 
-cm11a.prototype.off = function (options, callback) {
-  var functionName, functionCode;
-
-  functionName = "On";
-  functionCode = _functionCodes[functionName];
-
-  console.log(functionName);
-
+// The transmission for both ACK and REQ are one byte of function data in the standard hc:function format.	The REQ command appears to use any house code.
+Controller.prototype.hailRequest = function (callback) {
+	this.once('hailrequest', callback);
+	this.sp.write([HAIL_REQUEST]);
 };
 
-cm11a.prototype.serialRing = cm11a.prototype.ringIndicator = cm11a.prototype.RI = function (enableRing, callback) {
-  console.log("serial ring indicator signal");
-
-  enableRing = enableRing ? enableRing : true;
-  
-  var transmission;
-  
-  if (enableRing) {
-    transmission = parseInt("0xeb", 16);
-    // tx 0xeb Enable the ring signal
-  } else {
-    transmission = parseInt("0xdb", 16);
-    // tx 0xdb Disable the ring signal
-  }
-  // rx checksum (same as transmission)
-  // tx 0x00 Checksum correct 
-  // rx 0x55 Interface ready
+// The transmission for both ACK and REQ are one byte of function data in the standard hc:function format. The ACK should contain the house code that you have active.	If you have several house codes, you could reply with all of them, one after the other.
+Controller.prototype.hailAcknowlege = function (callback) {
+	this.once('hailacknowledge', callback);
+	this.sp.write([HAIL_ACKNOWLEDGE]);
 };
 
-cm11a.prototype.disableSR = cm11a.prototype.disableRI = function (callback) {
-  this.serialRing(false, callback);
+Controller.prototype.address = function (addresses, callback) {
+	addresses = _.isArray(addresses) ? addresses : [addresses];
+	oneCallback = _.after(addresses.length, callback);
+	_.each(addresses, function (address) {
+		if (! (address instanceof X10Address)) {
+			address = new X10Address(address);
+		}
+		this.transmit([0x04, address], oneCallback);
+		this.monitored.devices.lastAddressed = address;
+		this.emit("address", address);
+	});
 };
 
-cm11a.prototype.enableSR = cm11a.prototype.enableRI = function (callback) {
-  this.serialRing(true, callback);
+Controller.prototype.command = function (command, callback) {
+	var functionCode, headerCode, houseCode;
+	if (! (command instanceof X10Command)) {
+		command = new X10Command(command);
+	}
+	houseCode = this.monitored.devices.lastAddressed.houseCode;
+	functionCode = houseCode<<4|command;
+	headerCode = 0x6;  // for a standard function
+	this.transmit([headerCode, functionCode], callback);
+	this.emit("command", command);
 };
 
-// request the current status from the interface
-cm11a.prototype.status = cm11a.prototype.statusRequest = function (callback) {
-  var _signal = parseInt("0x8b", 16);
-  
-  // see section 9 of docs/protocol.txt
+module.exports = {
+	Controller: Controller,
+	X10Address: X10Address
 };
-
-// The transmission for both ACK and REQ are one byte of function data in the standard hc:function format.  The REQ command appears to use any house code.
-cm11a.prototype.hail = cm11a.prototype.hailReq = cm11a.prototype.hailRequest = function (callback) {
-  
-};
-
-// The transmission for both ACK and REQ are one byte of function data in the standard hc:function format. The ACK should contain the house code that you have active.  If you have several house codes, you could reply with all of them, one after the other.
-cm11a.prototype.hailAck = cm11a.prototype.hailAcknowlege = function (callback) {
-  
-};
-
